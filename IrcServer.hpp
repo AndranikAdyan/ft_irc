@@ -25,6 +25,7 @@ private:
     int _listenFd;
     unsigned short _port;
     std::string _password;
+    std::string _creationDate;
     bool _running;
     std::map<int, Client> _clients;
     std::map<std::string, Channel> _channels;
@@ -41,7 +42,8 @@ private:
     void handleRegistration(int fd, const std::string &command,
                             const std::vector<std::string> &params,
                             const std::string &trailing);
-    void handleJoin(int fd, const std::vector<std::string> &params);
+    void handleJoin(int fd, const std::vector<std::string> &params,
+                    const std::string &trailing);
     void handlePart(int fd, const std::vector<std::string> &params,
                     const std::string &trailing);
     void handlePrivmsg(int fd, const std::vector<std::string> &params,

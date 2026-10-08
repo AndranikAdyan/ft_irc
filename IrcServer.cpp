@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <iostream>
 #include <limits>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -16,7 +18,15 @@ static const std::size_t MAX_OUTPUT = 65536;
 extern volatile sig_atomic_t g_stop;
 
 IrcServer::IrcServer(unsigned short port, const std::string &password)
-    : _listenFd(-1), _port(port), _password(password), _running(false) {}
+    : _listenFd(-1), _port(port), _password(password), _creationDate(),
+      _running(false) {
+    std::time_t now = std::time(0);
+    const char *date = std::ctime(&now);
+    if (date != 0)
+        _creationDate = date;
+    if (!_creationDate.empty() && _creationDate[_creationDate.size() - 1] == '\n')
+        _creationDate.erase(_creationDate.size() - 1);
+}
 
 IrcServer::~IrcServer() {
     stop();
@@ -51,6 +61,7 @@ bool IrcServer::start() {
         return false;
     }
     _running = true;
+    std::cerr << "[INFO] Listening on 0.0.0.0:" << _port << std::endl;
     return true;
 }
 
@@ -238,7 +249,7 @@ void IrcServer::handleCommand(int fd, const std::string &command,
     }
     if (command == "PING") {
         queue(fd, ":ircserv PONG ircserv :" + (trailing.empty() ? (params.empty() ? "ircserv" : params[0]) : trailing) + "\r\n");
-    } else if (command == "JOIN") handleJoin(fd, params);
+    } else if (command == "JOIN") handleJoin(fd, params, trailing);
     else if (command == "PART") handlePart(fd, params, trailing);
     else if (command == "PRIVMSG") handlePrivmsg(fd, params, trailing);
     else if (command == "NOTICE") handlePrivmsg(fd, params, trailing);
@@ -263,22 +274,31 @@ void IrcServer::handleRegistration(int fd, const std::string &command,
         if (existing >= 0 && existing != fd) { numeric(fd, "433", params[0] + " :Nickname is already in use"); return; }
         client.nickname = params[0];
     } else {
-        if (params.empty()) { numeric(fd, "461", "USER :Not enough parameters"); return; }
+        if (params.size() != 3 || trailing.empty()) { numeric(fd, "461", "USER :Not enough parameters"); return; }
         client.username = params[0];
         client.realname = trailing;
     }
     if (client.passwordAccepted && !client.nickname.empty() && !client.username.empty() && !client.registered) {
         client.registered = true;
-        queue(fd, ":ircserv 001 " + client.nickname + " :Welcome to the IRC Network\r\n");
+        queue(fd, ":ircserv 001 " + client.nickname + " :Welcome to the IRC server!\r\n");
         queue(fd, ":ircserv 002 " + client.nickname + " :Your host is ircserv\r\n");
-        queue(fd, ":ircserv 003 " + client.nickname + " :This server was created today\r\n");
+        queue(fd, ":ircserv 003 " + client.nickname + " :This server was created " + _creationDate + "\r\n");
+        std::cerr << "[INFO] Client " << fd << " successfully registered as "
+                  << client.username << std::endl;
     }
 }
 
-void IrcServer::handleJoin(int fd, const std::vector<std::string> &params) {
-    if (params.empty()) { numeric(fd, "461", "JOIN :Not enough parameters"); return; }
+void IrcServer::handleJoin(int fd, const std::vector<std::string> &params,
+                           const std::string &trailing) {
+    if (params.empty()) {
+        if (!trailing.empty())
+            numeric(fd, "403", trailing + " :Cannot join channel");
+        else
+            numeric(fd, "461", "JOIN :Not enough parameters");
+        return;
+    }
     std::string name = params[0];
-    if (!validChannelName(name)) { numeric(fd, "403", name + " :No such channel"); return; }
+    if (!validChannelName(name)) { numeric(fd, "403", name + " :Cannot join channel"); return; }
     Client &client = _clients.find(fd)->second;
     Channel &channel = _channels.insert(std::make_pair(name, Channel(name))).first->second;
     if (channel.members.find(fd) != channel.members.end()) return;
@@ -290,6 +310,7 @@ void IrcServer::handleJoin(int fd, const std::vector<std::string> &params) {
     if (first) channel.operators.insert(fd);
     channel.invited.erase(fd);
     client.channels.insert(name);
+    std::cerr << "[INFO] User " << client.username << " added to " << name << std::endl;
     std::string message = ":" + prefix(client) + " JOIN " + name + "\r\n";
     broadcast(channel, -1, message);
     if (!channel.topic.empty()) numeric(fd, "332", name + " :" + channel.topic);
@@ -353,13 +374,14 @@ void IrcServer::handleInvite(int fd, const std::vector<std::string> &params) {
     if (it->second.members.find(target) != it->second.members.end()) { numeric(fd, "443", params[0] + " " + params[1] + " :User is already on channel"); return; }
     it->second.invited.insert(target);
     queue(target, ":" + prefix(_clients.find(fd)->second) + " INVITE " + params[0] + " " + params[1] + "\r\n");
-    numeric(fd, "341", params[0] + " " + params[1]);
+    queue(fd, ":ircserv 341 " + _clients.find(fd)->second.nickname + " " + params[0] + " " + params[1] + "\r\n");
 }
 
 void IrcServer::handleTopic(int fd, const std::vector<std::string> &params, const std::string &trailing) {
     if (params.empty()) { numeric(fd, "461", "TOPIC :Not enough parameters"); return; }
     std::map<std::string, Channel>::iterator it = _channels.find(params[0]);
-    if (it == _channels.end() || it->second.members.find(fd) == it->second.members.end()) { numeric(fd, "442", params[0] + " :You're not on that channel"); return; }
+    if (it == _channels.end()) { numeric(fd, "403", params[0] + " :No such channel"); return; }
+    if (it->second.members.find(fd) == it->second.members.end()) { numeric(fd, "442", params[0] + " :You're not on that channel"); return; }
     if (trailing.empty()) {
         if (it->second.topic.empty()) numeric(fd, "331", params[0] + " :No topic is set");
         else numeric(fd, "332", params[0] + " :" + it->second.topic);
