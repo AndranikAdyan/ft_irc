@@ -34,22 +34,33 @@ IrcServer::~IrcServer() {
 
 bool IrcServer::setupSocket() {
     _listenFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (_listenFd < 0)
+    if (_listenFd < 0) {
+        std::cerr << "[ERROR] socket: " << std::strerror(errno) << std::endl;
         return false;
+    }
     int reuse = 1;
-    if (setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0)
+    if (setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        std::cerr << "[ERROR] setsockopt: " << std::strerror(errno) << std::endl;
         return false;
-    if (fcntl(_listenFd, F_SETFL, O_NONBLOCK) < 0)
+    }
+    if (fcntl(_listenFd, F_SETFL, O_NONBLOCK) < 0) {
+        std::cerr << "[ERROR] fcntl(O_NONBLOCK): " << std::strerror(errno) << std::endl;
         return false;
+    }
     struct sockaddr_in address;
     std::memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons(_port);
-    if (bind(_listenFd, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) < 0)
+    if (bind(_listenFd, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) < 0) {
+        std::cerr << "[ERROR] bind on port " << _port << ": "
+                  << std::strerror(errno) << std::endl;
         return false;
-    if (listen(_listenFd, 64) < 0)
+    }
+    if (listen(_listenFd, 64) < 0) {
+        std::cerr << "[ERROR] listen: " << std::strerror(errno) << std::endl;
         return false;
+    }
     return true;
 }
 
@@ -161,8 +172,8 @@ void IrcServer::handleReadable(int fd) {
     Client &client = _clients.find(fd)->second;
     client.appendData(buffer, static_cast<std::size_t>(received));
     processInput(client);
-    if (client.bufferSize() > 65536)
-        client.discardIncompleteCommand();
+    if (hasClient(fd) && _clients.find(fd)->second.bufferSize() > 65536)
+        _clients.find(fd)->second.discardIncompleteCommand();
 }
 
 void IrcServer::handleWritable(int fd) {
@@ -186,12 +197,13 @@ void IrcServer::handleWritable(int fd) {
 }
 
 void IrcServer::processInput(Client &client) {
+    int clientFd = client.fd;
     std::vector<std::string> commands = client.extractCommands();
     for (std::size_t i = 0; i < commands.size(); ++i) {
         if (commands[i].size() > MAX_LINE)
             continue;
-        processLine(client.fd, commands[i]);
-        if (!hasClient(client.fd))
+        processLine(clientFd, commands[i]);
+        if (!hasClient(clientFd))
             return;
     }
 }
@@ -221,6 +233,10 @@ std::vector<std::string> IrcServer::splitWords(const std::string &line, std::str
 }
 
 void IrcServer::processLine(int fd, const std::string &line) {
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        if (line[i] == '\r' || line[i] == '\n' || line[i] == '\0')
+            return;
+    }
     std::string trailing;
     std::vector<std::string> words = splitWords(line, trailing);
     if (words.empty())
@@ -251,8 +267,8 @@ void IrcServer::handleCommand(int fd, const std::string &command,
         queue(fd, ":ircserv PONG ircserv :" + (trailing.empty() ? (params.empty() ? "ircserv" : params[0]) : trailing) + "\r\n");
     } else if (command == "JOIN") handleJoin(fd, params, trailing);
     else if (command == "PART") handlePart(fd, params, trailing);
-    else if (command == "PRIVMSG") handlePrivmsg(fd, params, trailing);
-    else if (command == "NOTICE") handlePrivmsg(fd, params, trailing);
+    else if (command == "PRIVMSG") handlePrivmsg(fd, params, trailing, false);
+    else if (command == "NOTICE") handlePrivmsg(fd, params, trailing, true);
     else if (command == "KICK") handleKick(fd, params, trailing);
     else if (command == "INVITE") handleInvite(fd, params);
     else if (command == "TOPIC") handleTopic(fd, params, trailing);
@@ -270,6 +286,7 @@ void IrcServer::handleRegistration(int fd, const std::string &command,
         else client.passwordAccepted = true;
     } else if (command == "NICK") {
         if (params.empty()) { numeric(fd, "431", ":No nickname given"); return; }
+        if (!validNickname(params[0])) { numeric(fd, "432", params[0] + " :Erroneous nickname"); return; }
         int existing = findNickname(params[0]);
         if (existing >= 0 && existing != fd) { numeric(fd, "433", params[0] + " :Nickname is already in use"); return; }
         client.nickname = params[0];
@@ -337,17 +354,31 @@ void IrcServer::handlePart(int fd, const std::vector<std::string> &params, const
     removeFromChannel(fd, params[0], reason, true);
 }
 
-void IrcServer::handlePrivmsg(int fd, const std::vector<std::string> &params, const std::string &trailing) {
-    if (params.empty() || trailing.empty()) { numeric(fd, "412", ":No text to send"); return; }
+void IrcServer::handlePrivmsg(int fd, const std::vector<std::string> &params,
+                              const std::string &trailing, bool notice) {
+    if (params.empty() || trailing.empty()) {
+        if (!notice)
+            numeric(fd, "412", ":No text to send");
+        return;
+    }
     Client &client = _clients.find(fd)->second;
-    std::string message = ":" + prefix(client) + " PRIVMSG " + params[0] + " :" + trailing + "\r\n";
+    std::string command = notice ? "NOTICE" : "PRIVMSG";
+    std::string message = ":" + prefix(client) + " " + command + " " + params[0] + " :" + trailing + "\r\n";
     if (params[0][0] == '#') {
         std::map<std::string, Channel>::iterator it = _channels.find(params[0]);
-        if (it == _channels.end() || it->second.members.find(fd) == it->second.members.end()) { numeric(fd, "442", params[0] + " :You're not on that channel"); return; }
+        if (it == _channels.end() || it->second.members.find(fd) == it->second.members.end()) {
+            if (!notice)
+                numeric(fd, "442", params[0] + " :You're not on that channel");
+            return;
+        }
         broadcast(it->second, fd, message);
     } else {
         int target = findNickname(params[0]);
-        if (target < 0) { numeric(fd, "401", params[0] + " :No such nick"); return; }
+        if (target < 0) {
+            if (!notice)
+                numeric(fd, "401", params[0] + " :No such nick");
+            return;
+        }
         queue(target, message);
     }
 }
@@ -519,6 +550,11 @@ void IrcServer::removeClient(int fd, const std::string &reason) {
     std::vector<std::string> names(it->second.channels.begin(), it->second.channels.end());
     for (std::size_t i = 0; i < names.size(); ++i)
         removeFromChannel(fd, names[i], reason, true);
+    std::map<std::string, Channel>::iterator channel = _channels.begin();
+    while (channel != _channels.end()) {
+        channel->second.invited.erase(fd);
+        ++channel;
+    }
     close(fd);
     _clients.erase(it);
 }
@@ -529,12 +565,25 @@ void IrcServer::removeFromChannel(int fd, const std::string &channelName, const 
     if (announce && hasClient(fd)) broadcast(it->second, -1, ":" + prefix(_clients.find(fd)->second) + " PART " + channelName + " :" + reason + "\r\n");
     it->second.members.erase(fd);
     it->second.operators.erase(fd);
+    if (it->second.operators.empty() && !it->second.members.empty())
+        it->second.operators.insert(*it->second.members.begin());
     if (hasClient(fd)) _clients.find(fd)->second.channels.erase(channelName);
     if (it->second.members.empty()) _channels.erase(it);
 }
 
 bool IrcServer::hasClient(int fd) const { return _clients.find(fd) != _clients.end(); }
 bool IrcServer::validChannelName(const std::string &name) const { return name.size() > 1 && name[0] == '#' && name.find(' ') == std::string::npos; }
+bool IrcServer::validNickname(const std::string &nickname) const {
+    if (nickname.empty() || nickname.size() > 30)
+        return false;
+    for (std::size_t i = 0; i < nickname.size(); ++i) {
+        unsigned char character = static_cast<unsigned char>(nickname[i]);
+        if (character < 0x21 || character == ':' || character == ',' ||
+            character == '*' || character == '?' || character == '!')
+            return false;
+    }
+    return true;
+}
 bool IrcServer::isOperator(const Channel &channel, int fd) const { return channel.operators.find(fd) != channel.operators.end(); }
 
 int IrcServer::findNickname(const std::string &nickname) const {

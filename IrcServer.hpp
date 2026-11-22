@@ -47,7 +47,7 @@ private:
     void handlePart(int fd, const std::vector<std::string> &params,
                     const std::string &trailing);
     void handlePrivmsg(int fd, const std::vector<std::string> &params,
-                       const std::string &trailing);
+                       const std::string &trailing, bool notice);
     void handleKick(int fd, const std::vector<std::string> &params,
                     const std::string &trailing);
     void handleInvite(int fd, const std::vector<std::string> &params);
@@ -65,6 +65,7 @@ private:
                            const std::string &reason, bool announce);
     bool hasClient(int fd) const;
     bool validChannelName(const std::string &name) const;
+    bool validNickname(const std::string &nickname) const;
     bool isOperator(const Channel &channel, int fd) const;
     int findNickname(const std::string &nickname) const;
     std::string prefix(const Client &client) const;
