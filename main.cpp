@@ -1,4 +1,4 @@
-#include "Server.hpp"
+#include "IrcServer.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &action, 0);
     signal(SIGPIPE, SIG_IGN);
 
-    Server server(port, argv[2]);
+    IrcServer server(port, argv[2]);
     if (!server.start())
         return 1;
     server.run();
