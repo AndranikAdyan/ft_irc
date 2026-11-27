@@ -10,7 +10,6 @@ public:
     int fd;
     bool passwordAccepted;
     bool registered;
-    bool welcomed;
     bool closeRequested;
     std::string nickname;
     std::string username;
@@ -21,7 +20,7 @@ public:
 
     explicit Client(int descriptor)
         : fd(descriptor), passwordAccepted(false), registered(false),
-          welcomed(false), closeRequested(false), outputOffset(0) {}
+          closeRequested(false), outputOffset(0) {}
 
     void appendData(const char *data, std::size_t length) {
       _buffer.append(data, length);

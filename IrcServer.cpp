@@ -234,7 +234,7 @@ std::vector<std::string> IrcServer::splitWords(const std::string &line, std::str
 
 void IrcServer::processLine(int fd, const std::string &line) {
     for (std::size_t i = 0; i < line.size(); ++i) {
-        if (line[i] == '\r' || line[i] == '\n' || line[i] == '\0')
+        if (line[i] == '\0')
             return;
     }
     std::string trailing;
@@ -282,15 +282,35 @@ void IrcServer::handleRegistration(int fd, const std::string &command,
                                    const std::string &trailing) {
     Client &client = _clients.find(fd)->second;
     if (command == "PASS") {
-        if (params.empty() || params[0] != _password) numeric(fd, "464", ":Password incorrect");
+        if (client.registered) { numeric(fd, "462", ":You may not reregister"); return; }
+        if (params.empty()) { numeric(fd, "461", "PASS :Not enough parameters"); return; }
+        if (params[0] != _password) { client.passwordAccepted = false; numeric(fd, "464", ":Password incorrect"); }
         else client.passwordAccepted = true;
     } else if (command == "NICK") {
         if (params.empty()) { numeric(fd, "431", ":No nickname given"); return; }
         if (!validNickname(params[0])) { numeric(fd, "432", params[0] + " :Erroneous nickname"); return; }
         int existing = findNickname(params[0]);
         if (existing >= 0 && existing != fd) { numeric(fd, "433", params[0] + " :Nickname is already in use"); return; }
-        client.nickname = params[0];
+        if (client.registered) {
+            std::string oldPrefix = prefix(client);
+            std::string oldNick = client.nickname;
+            client.nickname = params[0];
+            if (oldNick != params[0]) {
+                std::string msg = ":" + oldPrefix + " NICK :" + params[0] + "\r\n";
+                queue(fd, msg);
+                std::set<std::string>::const_iterator ch = client.channels.begin();
+                while (ch != client.channels.end()) {
+                    std::map<std::string, Channel>::const_iterator it = _channels.find(*ch);
+                    if (it != _channels.end())
+                        broadcast(it->second, fd, msg);
+                    ++ch;
+                }
+            }
+        } else {
+            client.nickname = params[0];
+        }
     } else {
+        if (client.registered) { numeric(fd, "462", ":You may not reregister"); return; }
         if (params.size() != 3 || trailing.empty()) { numeric(fd, "461", "USER :Not enough parameters"); return; }
         client.username = params[0];
         client.realname = trailing;
