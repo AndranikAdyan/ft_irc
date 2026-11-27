@@ -6,6 +6,7 @@
 #include <ctime>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -13,7 +14,7 @@
 #include <signal.h>
 #include <unistd.h>
 
-static const std::size_t MAX_LINE = 512;
+static const std::size_t MAX_LINE_CONTENT = 510;
 static const std::size_t MAX_OUTPUT = 65536;
 extern volatile sig_atomic_t g_stop;
 
@@ -200,7 +201,7 @@ void IrcServer::processInput(Client &client) {
     int clientFd = client.fd;
     std::vector<std::string> commands = client.extractCommands();
     for (std::size_t i = 0; i < commands.size(); ++i) {
-        if (commands[i].size() > MAX_LINE)
+        if (commands[i].size() > MAX_LINE_CONTENT)
             continue;
         processLine(clientFd, commands[i]);
         if (!hasClient(clientFd))
@@ -264,7 +265,12 @@ void IrcServer::handleCommand(int fd, const std::string &command,
         return;
     }
     if (command == "PING") {
-        queue(fd, ":ircserv PONG ircserv :" + (trailing.empty() ? (params.empty() ? "ircserv" : params[0]) : trailing) + "\r\n");
+        if (params.empty() && trailing.empty()) {
+            numeric(fd, "409", ":No origin specified");
+            return;
+        }
+        queue(fd, ":ircserv PONG ircserv :" +
+              (trailing.empty() ? params[0] : trailing) + "\r\n");
     } else if (command == "JOIN") handleJoin(fd, params, trailing);
     else if (command == "PART") handlePart(fd, params, trailing);
     else if (command == "PRIVMSG") handlePrivmsg(fd, params, trailing, false);
@@ -337,7 +343,8 @@ void IrcServer::handleJoin(int fd, const std::vector<std::string> &params,
     std::string name = params[0];
     if (!validChannelName(name)) { numeric(fd, "403", name + " :Cannot join channel"); return; }
     Client &client = _clients.find(fd)->second;
-    Channel &channel = _channels.insert(std::make_pair(name, Channel(name))).first->second;
+    std::string key = foldCase(name);
+    Channel &channel = _channels.insert(std::make_pair(key, Channel(name))).first->second;
     if (channel.members.find(fd) != channel.members.end()) return;
     if (channel.inviteOnly && channel.invited.find(fd) == channel.invited.end()) { numeric(fd, "473", name + " :Invite-only channel"); return; }
     if (channel.hasKey && (params.size() < 2 || params[1] != channel.key)) { numeric(fd, "475", name + " :Bad channel key"); return; }
@@ -346,11 +353,11 @@ void IrcServer::handleJoin(int fd, const std::vector<std::string> &params,
     channel.members.insert(fd);
     if (first) channel.operators.insert(fd);
     channel.invited.erase(fd);
-    client.channels.insert(name);
+    client.channels.insert(key);
     std::cerr << "[INFO] User " << client.username << " added to " << name << std::endl;
-    std::string message = ":" + prefix(client) + " JOIN " + name + "\r\n";
+    std::string message = ":" + prefix(client) + " JOIN " + channel.name + "\r\n";
     broadcast(channel, -1, message);
-    if (!channel.topic.empty()) numeric(fd, "332", name + " :" + channel.topic);
+    if (!channel.topic.empty()) numeric(fd, "332", channel.name + " :" + channel.topic);
     std::string memberNames;
     std::set<int>::const_iterator member = channel.members.begin();
     while (member != channel.members.end()) {
@@ -364,33 +371,54 @@ void IrcServer::handleJoin(int fd, const std::vector<std::string> &params,
         }
         ++member;
     }
-    numeric(fd, "353", "= " + name + " :" + memberNames);
-    numeric(fd, "366", name + " :End of /NAMES list");
+    numeric(fd, "353", "= " + channel.name + " :" + memberNames);
+    numeric(fd, "366", channel.name + " :End of /NAMES list");
 }
 
 void IrcServer::handlePart(int fd, const std::vector<std::string> &params, const std::string &trailing) {
     if (params.empty()) { numeric(fd, "461", "PART :Not enough parameters"); return; }
+    std::string key = foldCase(params[0]);
+    std::map<std::string, Channel>::const_iterator channel = _channels.find(key);
+    if (channel == _channels.end()) {
+        numeric(fd, "403", params[0] + " :No such channel");
+        return;
+    }
+    if (channel->second.members.find(fd) == channel->second.members.end()) {
+        numeric(fd, "442", params[0] + " :You're not on that channel");
+        return;
+    }
     std::string reason = trailing.empty() ? _clients.find(fd)->second.nickname : trailing;
-    removeFromChannel(fd, params[0], reason, true);
+    removeFromChannel(fd, key, reason, true);
 }
 
 void IrcServer::handlePrivmsg(int fd, const std::vector<std::string> &params,
                               const std::string &trailing, bool notice) {
-    if (params.empty() || trailing.empty()) {
+    if (params.empty()) {
+        if (!notice)
+            numeric(fd, "411", ":No recipient given");
+        return;
+    }
+    if (trailing.empty()) {
         if (!notice)
             numeric(fd, "412", ":No text to send");
         return;
     }
     Client &client = _clients.find(fd)->second;
     std::string command = notice ? "NOTICE" : "PRIVMSG";
-    std::string message = ":" + prefix(client) + " " + command + " " + params[0] + " :" + trailing + "\r\n";
     if (params[0][0] == '#') {
-        std::map<std::string, Channel>::iterator it = _channels.find(params[0]);
-        if (it == _channels.end() || it->second.members.find(fd) == it->second.members.end()) {
+        std::map<std::string, Channel>::iterator it = _channels.find(foldCase(params[0]));
+        if (it == _channels.end()) {
             if (!notice)
-                numeric(fd, "442", params[0] + " :You're not on that channel");
+                numeric(fd, "403", params[0] + " :No such channel");
             return;
         }
+        if (it->second.members.find(fd) == it->second.members.end()) {
+            if (!notice)
+                numeric(fd, "404", params[0] + " :Cannot send to channel");
+            return;
+        }
+        std::string message = ":" + prefix(client) + " " + command + " " +
+                             it->second.name + " :" + trailing + "\r\n";
         broadcast(it->second, fd, message);
     } else {
         int target = findNickname(params[0]);
@@ -399,53 +427,61 @@ void IrcServer::handlePrivmsg(int fd, const std::vector<std::string> &params,
                 numeric(fd, "401", params[0] + " :No such nick");
             return;
         }
+        std::string message = ":" + prefix(client) + " " + command + " " +
+                             params[0] + " :" + trailing + "\r\n";
         queue(target, message);
     }
 }
 
 void IrcServer::handleKick(int fd, const std::vector<std::string> &params, const std::string &trailing) {
     if (params.size() < 2) { numeric(fd, "461", "KICK :Not enough parameters"); return; }
-    std::map<std::string, Channel>::iterator it = _channels.find(params[0]);
-    if (it == _channels.end() || !isOperator(it->second, fd)) { numeric(fd, "482", params[0] + " :You're not channel operator"); return; }
+    std::string key = foldCase(params[0]);
+    std::map<std::string, Channel>::iterator it = _channels.find(key);
+    if (it == _channels.end()) { numeric(fd, "403", params[0] + " :No such channel"); return; }
+    if (it->second.members.find(fd) == it->second.members.end()) {
+        numeric(fd, "442", params[0] + " :You're not on that channel");
+        return;
+    }
+    if (!isOperator(it->second, fd)) { numeric(fd, "482", params[0] + " :You're not channel operator"); return; }
     int target = findNickname(params[1]);
     if (target < 0 || it->second.members.find(target) == it->second.members.end()) { numeric(fd, "441", params[1] + " " + params[0] + " :They aren't on that channel"); return; }
     Client &client = _clients.find(fd)->second;
-    std::string message = ":" + prefix(client) + " KICK " + params[0] + " " + params[1] + " :" + (trailing.empty() ? params[1] : trailing) + "\r\n";
+    std::string message = ":" + prefix(client) + " KICK " + it->second.name + " " + params[1] + " :" + (trailing.empty() ? params[1] : trailing) + "\r\n";
     broadcast(it->second, -1, message);
-    removeFromChannel(target, params[0], trailing.empty() ? "Kicked" : trailing, false);
+    removeFromChannel(target, key, trailing.empty() ? "Kicked" : trailing, false);
 }
 
 void IrcServer::handleInvite(int fd, const std::vector<std::string> &params) {
     if (params.size() < 2) { numeric(fd, "461", "INVITE :Not enough parameters"); return; }
-    std::map<std::string, Channel>::iterator it = _channels.find(params[1]);
+    std::map<std::string, Channel>::iterator it = _channels.find(foldCase(params[1]));
     int target = findNickname(params[0]);
     if (target < 0) { numeric(fd, "401", params[0] + " :No such nick"); return; }
     if (it == _channels.end()) { numeric(fd, "403", params[1] + " :No such channel"); return; }
-    if (it->second.members.find(fd) == it->second.members.end() || !isOperator(it->second, fd)) { numeric(fd, "482", params[1] + " :You're not channel operator"); return; }
+    if (it->second.members.find(fd) == it->second.members.end() || !isOperator(it->second, fd)) { numeric(fd, "482", it->second.name + " :You're not channel operator"); return; }
     if (it->second.members.find(target) != it->second.members.end()) { numeric(fd, "443", params[0] + " " + params[1] + " :User is already on channel"); return; }
     it->second.invited.insert(target);
-    queue(target, ":" + prefix(_clients.find(fd)->second) + " INVITE " + params[0] + " " + params[1] + "\r\n");
-    queue(fd, ":ircserv 341 " + _clients.find(fd)->second.nickname + " " + params[0] + " " + params[1] + "\r\n");
+    queue(target, ":" + prefix(_clients.find(fd)->second) + " INVITE " + params[0] + " " + it->second.name + "\r\n");
+    queue(fd, ":ircserv 341 " + _clients.find(fd)->second.nickname + " " + params[0] + " " + it->second.name + "\r\n");
 }
 
 void IrcServer::handleTopic(int fd, const std::vector<std::string> &params, const std::string &trailing) {
     if (params.empty()) { numeric(fd, "461", "TOPIC :Not enough parameters"); return; }
-    std::map<std::string, Channel>::iterator it = _channels.find(params[0]);
+    std::map<std::string, Channel>::iterator it = _channels.find(foldCase(params[0]));
     if (it == _channels.end()) { numeric(fd, "403", params[0] + " :No such channel"); return; }
-    if (it->second.members.find(fd) == it->second.members.end()) { numeric(fd, "442", params[0] + " :You're not on that channel"); return; }
+    if (it->second.members.find(fd) == it->second.members.end()) { numeric(fd, "442", it->second.name + " :You're not on that channel"); return; }
     if (trailing.empty()) {
-        if (it->second.topic.empty()) numeric(fd, "331", params[0] + " :No topic is set");
-        else numeric(fd, "332", params[0] + " :" + it->second.topic);
+        if (it->second.topic.empty()) numeric(fd, "331", it->second.name + " :No topic is set");
+        else numeric(fd, "332", it->second.name + " :" + it->second.topic);
         return;
     }
-    if (it->second.topicOperatorsOnly && !isOperator(it->second, fd)) { numeric(fd, "482", params[0] + " :You're not channel operator"); return; }
+    if (it->second.topicOperatorsOnly && !isOperator(it->second, fd)) { numeric(fd, "482", it->second.name + " :You're not channel operator"); return; }
     it->second.topic = trailing;
-    broadcast(it->second, -1, ":" + prefix(_clients.find(fd)->second) + " TOPIC " + params[0] + " :" + trailing + "\r\n");
+    broadcast(it->second, -1, ":" + prefix(_clients.find(fd)->second) + " TOPIC " + it->second.name + " :" + trailing + "\r\n");
 }
 
 void IrcServer::handleMode(int fd, const std::vector<std::string> &params) {
     if (params.empty()) { numeric(fd, "461", "MODE :Not enough parameters"); return; }
-    std::map<std::string, Channel>::iterator it = _channels.find(params[0]);
+    std::map<std::string, Channel>::iterator it = _channels.find(foldCase(params[0]));
     if (it == _channels.end()) { numeric(fd, "403", params[0] + " :No such channel"); return; }
     if (params.size() == 1) {
         std::string modes = "+";
@@ -531,7 +567,7 @@ void IrcServer::handleMode(int fd, const std::vector<std::string> &params) {
         else if (flag == 'o') { numeric(fd, "461", "MODE :Not enough parameters"); return; }
         else { numeric(fd, "472", std::string(1, flag) + " :is unknown mode char to me"); return; }
     }
-    std::string modeMessage = ":" + prefix(_clients.find(fd)->second) + " MODE " + params[0] + " " + params[1];
+    std::string modeMessage = ":" + prefix(_clients.find(fd)->second) + " MODE " + it->second.name + " " + params[1];
     for (std::size_t i = 2; i < params.size(); ++i)
         modeMessage += " " + params[i];
     broadcast(it->second, -1, modeMessage + "\r\n");
@@ -568,8 +604,21 @@ void IrcServer::removeClient(int fd, const std::string &reason) {
     std::map<int, Client>::iterator it = _clients.find(fd);
     if (it == _clients.end()) return;
     std::vector<std::string> names(it->second.channels.begin(), it->second.channels.end());
+    std::set<int> notified;
+    std::string quitMessage = ":" + prefix(it->second) + " QUIT :" + reason + "\r\n";
     for (std::size_t i = 0; i < names.size(); ++i)
-        removeFromChannel(fd, names[i], reason, true);
+    {
+        std::map<std::string, Channel>::iterator channel = _channels.find(names[i]);
+        if (channel != _channels.end()) {
+            std::set<int>::const_iterator member = channel->second.members.begin();
+            while (member != channel->second.members.end()) {
+                if (*member != fd && notified.insert(*member).second)
+                    queue(*member, quitMessage);
+                ++member;
+            }
+        }
+        removeFromChannel(fd, names[i], reason, false);
+    }
     std::map<std::string, Channel>::iterator channel = _channels.begin();
     while (channel != _channels.end()) {
         channel->second.invited.erase(fd);
@@ -580,14 +629,15 @@ void IrcServer::removeClient(int fd, const std::string &reason) {
 }
 
 void IrcServer::removeFromChannel(int fd, const std::string &channelName, const std::string &reason, bool announce) {
-    std::map<std::string, Channel>::iterator it = _channels.find(channelName);
+    std::string key = foldCase(channelName);
+    std::map<std::string, Channel>::iterator it = _channels.find(key);
     if (it == _channels.end() || it->second.members.find(fd) == it->second.members.end()) return;
-    if (announce && hasClient(fd)) broadcast(it->second, -1, ":" + prefix(_clients.find(fd)->second) + " PART " + channelName + " :" + reason + "\r\n");
+    if (announce && hasClient(fd)) broadcast(it->second, -1, ":" + prefix(_clients.find(fd)->second) + " PART " + it->second.name + " :" + reason + "\r\n");
     it->second.members.erase(fd);
     it->second.operators.erase(fd);
     if (it->second.operators.empty() && !it->second.members.empty())
         it->second.operators.insert(*it->second.members.begin());
-    if (hasClient(fd)) _clients.find(fd)->second.channels.erase(channelName);
+    if (hasClient(fd)) _clients.find(fd)->second.channels.erase(key);
     if (it->second.members.empty()) _channels.erase(it);
 }
 
@@ -608,8 +658,31 @@ bool IrcServer::isOperator(const Channel &channel, int fd) const { return channe
 
 int IrcServer::findNickname(const std::string &nickname) const {
     std::map<int, Client>::const_iterator it = _clients.begin();
-    while (it != _clients.end()) { if (it->second.nickname == nickname) return it->first; ++it; }
+    std::string key = foldCase(nickname);
+    while (it != _clients.end()) {
+        if (foldCase(it->second.nickname) == key)
+            return it->first;
+        ++it;
+    }
     return -1;
+}
+
+std::string IrcServer::foldCase(const std::string &value) {
+    std::string result = value;
+    for (std::size_t i = 0; i < result.size(); ++i) {
+        unsigned char character = static_cast<unsigned char>(result[i]);
+        if (character >= 'A' && character <= 'Z')
+            result[i] = static_cast<char>(character + ('a' - 'A'));
+        else if (character == '[')
+            result[i] = '{';
+        else if (character == ']')
+            result[i] = '}';
+        else if (character == '\\')
+            result[i] = '|';
+        else if (character == '^')
+            result[i] = '~';
+    }
+    return result;
 }
 
 std::string IrcServer::prefix(const Client &client) const {

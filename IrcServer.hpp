@@ -69,6 +69,7 @@ private:
     bool isOperator(const Channel &channel, int fd) const;
     int findNickname(const std::string &nickname) const;
     std::string prefix(const Client &client) const;
+    static std::string foldCase(const std::string &value);
     static std::string upper(const std::string &value);
     static std::vector<std::string> splitWords(const std::string &line,
                                                 std::string &trailing);
